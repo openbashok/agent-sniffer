@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>agent-sniffer · viewer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  .scroll-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+  .scroll-thin::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+  pre { white-space: pre-wrap; word-break: break-word; }
+  textarea { font-family: ui-monospace, monospace; }
+  .injected { background: rgba(239, 68, 68, 0.08); border-left: 3px solid #ef4444; }
+  .injection-label { background: #7f1d1d; color: #fecaca; font-size: 9px; padding: 1px 4px; border-radius: 2px; }
+  .diff-added { background: rgba(16, 185, 129, 0.12); border-left: 3px solid #10b981; padding: 4px 8px; }
+  .diff-removed { background: rgba(239, 68, 68, 0.12); border-left: 3px solid #ef4444; padding: 4px 8px; text-decoration: line-through; opacity: 0.7; }
+  .diff-unchanged { color: #6b7280; padding: 4px 8px; }
+</style>
+</head>
+<body class="bg-gray-950 text-gray-200 h-screen overflow-hidden">
+
+<div class="flex flex-col h-full">
+
+  <header class="flex items-center justify-between px-4 py-2 border-b border-gray-800 bg-gray-900">
+    <div class="flex items-center gap-3">
+      <span class="text-lg font-bold text-emerald-400">agent-sniffer</span>
+      <span class="text-xs text-gray-500">openbashok</span>
+    </div>
+    <div class="flex items-center gap-3 text-xs">
+      <span id="status-dot" class="w-2 h-2 rounded-full bg-red-500"></span>
+      <span id="status-text" class="text-gray-400">disconnected</span>
+
+      <span class="text-gray-600 mx-2">|</span>
+
+      <label class="flex items-center gap-1 cursor-pointer">
+        <input type="checkbox" id="intercept-req" class="accent-amber-500">
+        <span class="text-amber-400">intercept REQ</span>
+      </label>
+      <label class="flex items-center gap-1 cursor-pointer">
+        <input type="checkbox" id="intercept-res" class="accent-amber-500">
+        <span class="text-amber-400">intercept RES</span>
+      </label>
+
+      <span class="text-gray-600 mx-2">|</span>
+
+      <button id="toggle-rules" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded">
+        rules <span id="rules-badge" class="ml-1 px-1 rounded bg-emerald-700 text-[10px]">0</span>
+      </button>
+      <button id="api-key-btn" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded">
+        api key <span id="api-key-dot" class="ml-1 w-2 h-2 inline-block rounded-full bg-red-500 align-middle"></span>
+      </button>
+      <button id="clear" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded">clear</button>
+    </div>
+  </header>
+
+  <div class="px-4 py-1 border-b border-gray-800 bg-gray-900 flex items-center gap-2 text-xs">
+    <span class="text-gray-500">filter:</span>
+    <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="messages" checked> <span class="text-emerald-400">messages</span></label>
+    <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="mcp_registry"> <span class="text-cyan-400">mcp_registry</span></label>
+    <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="telemetry"> <span class="text-yellow-400">telemetry</span></label>
+    <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="datadog"> <span class="text-orange-400">datadog</span></label>
+    <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="npm"> <span class="text-pink-400">npm</span></label>
+    <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="anthropic_other"> <span class="text-gray-400">other</span></label>
+  </div>
+
+  <div id="intercept-bar" class="hidden bg-amber-950 border-b border-amber-700 px-4 py-2 text-xs">
+    <span class="text-amber-300 font-bold">⏸ HELD:</span>
+    <span id="intercept-info" class="ml-2"></span>
+    <button id="intercept-edit" class="ml-2 px-2 py-0.5 bg-amber-700 hover:bg-amber-600 rounded">edit</button>
+    <button id="intercept-release" class="ml-2 px-2 py-0.5 bg-emerald-700 hover:bg-emerald-600 rounded">release</button>
+    <button id="intercept-drop" class="ml-2 px-2 py-0.5 bg-red-700 hover:bg-red-600 rounded">drop</button>
+  </div>
+
+  <div class="flex flex-1 overflow-hidden">
+
+    <aside id="timeline-aside" class="w-80 border-r border-gray-800 overflow-y-auto scroll-thin bg-gray-900">
+      <div class="px-3 py-2 text-xs uppercase text-gray-500 border-b border-gray-800 sticky top-0 bg-gray-900 z-10">timeline</div>
+      <ul id="timeline" class="text-xs"></ul>
+    </aside>
+
+    <section class="flex-1 flex flex-col overflow-hidden">
+      <nav class="flex border-b border-gray-800 bg-gray-900 text-sm items-center">
+        <button data-tab="system" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">system</button>
+        <button data-tab="messages" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">messages</button>
+        <button data-tab="tools" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">tools</button>
+        <button data-tab="response" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">response</button>
+        <button data-tab="diff" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">diff</button>
+        <button data-tab="raw" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">raw</button>
+        <div class="flex-1"></div>
+        <button id="replay-btn" class="mr-2 px-3 py-1 bg-purple-700 hover:bg-purple-600 rounded text-xs">↺ replay</button>
+      </nav>
+      <div id="detail" class="flex-1 overflow-y-auto scroll-thin p-4 text-sm">
+        <div class="text-gray-500 italic">Select an event from the timeline.</div>
+      </div>
+    </section>
+
+    <aside id="rules-panel" class="w-96 border-l border-gray-800 overflow-y-auto scroll-thin bg-gray-900 hidden">
+      <div class="flex items-center justify-between px-3 py-2 border-b border-gray-800">
+        <span class="text-xs uppercase text-gray-500">match &amp; replace</span>
+        <div class="flex gap-1">
+          <button id="reset-presets" class="text-xs px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded" title="Restore preset rules (all disabled)">reset</button>
+          <button id="add-rule" class="text-xs px-2 py-0.5 bg-emerald-700 hover:bg-emerald-600 rounded">+ rule</button>
+        </div>
+      </div>
+      <div class="px-3 py-2 text-[10px] text-gray-500 border-b border-gray-800 leading-relaxed">
+        Presets ship <b>disabled</b>. Toggle one on to apply it to outgoing/incoming flows in real time.
+      </div>
+      <div id="rules-list" class="p-2 space-y-2"></div>
+    </aside>
+  </div>
+</div>
+
+<!-- Intercept edit modal -->
+<div id="edit-modal" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center">
+  <div class="bg-gray-900 border border-gray-700 rounded-lg p-4 w-3/4 max-w-4xl h-3/4 flex flex-col">
+    <div class="flex items-center justify-between mb-2">
+      <span class="text-sm text-amber-400">Edit raw body before release</span>
+      <button id="edit-close" class="text-gray-400 hover:text-white">✕</button>
+    </div>
+    <textarea id="edit-textarea" class="flex-1 bg-gray-950 border border-gray-700 rounded p-2 text-xs text-gray-200"></textarea>
+    <div class="flex justify-end gap-2 mt-2">
+      <button id="edit-cancel" class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">cancel</button>
+      <button id="edit-apply" class="px-3 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-sm">release with edits</button>
+    </div>
+  </div>
+</div>
+
+<!-- API Key modal -->
+<div id="apikey-modal" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center">
+  <div class="bg-gray-900 border border-gray-700 rounded-lg p-4 w-full max-w-lg">
+    <div class="flex items-center justify-between mb-2">
+      <span class="text-sm text-purple-400">Anthropic API Key (replay only)</span>
+      <button id="apikey-close" class="text-gray-400 hover:text-white">✕</button>
+    </div>
+    <p class="text-xs text-gray-400 mb-2">Used only when you click <b>↺ replay</b>. Kept in memory; never persisted, never logged. Replays bill your account.</p>
+    <input id="apikey-input" type="password" placeholder="sk-ant-api03-..." class="w-full bg-gray-950 border border-gray-700 rounded p-2 text-xs text-gray-200 mb-2">
+    <div class="flex justify-between items-center">
+      <button id="apikey-from-capture" class="text-xs text-gray-400 hover:text-white underline">use last captured key</button>
+      <div class="flex gap-2">
+        <button id="apikey-clear" class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">clear</button>
+        <button id="apikey-save" class="px-3 py-1 bg-purple-700 hover:bg-purple-600 rounded text-sm">save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Replay modal -->
+<div id="replay-modal" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center">
+  <div class="bg-gray-900 border border-purple-700 rounded-lg p-4 w-11/12 max-w-6xl h-5/6 flex flex-col">
+    <div class="flex items-center justify-between mb-2">
+      <div>
+        <span class="text-sm text-purple-400 font-bold">↺ Replay</span>
+        <span class="text-xs text-gray-400 ml-2">edit and resend directly to api.anthropic.com (bills your account)</span>
+      </div>
+      <button id="replay-close" class="text-gray-400 hover:text-white">✕</button>
+    </div>
+    <div class="flex flex-1 gap-2 overflow-hidden">
+      <div class="flex-1 flex flex-col">
+        <div class="text-xs text-gray-500 mb-1">REQUEST BODY (editable)</div>
+        <textarea id="replay-body" class="flex-1 bg-gray-950 border border-gray-700 rounded p-2 text-xs text-gray-200"></textarea>
+      </div>
+      <div class="flex-1 flex flex-col">
+        <div class="text-xs text-gray-500 mb-1">RESPONSE</div>
+        <div id="replay-response" class="flex-1 bg-gray-950 border border-gray-700 rounded p-2 text-xs text-gray-200 overflow-auto scroll-thin">
+          <span class="text-gray-500 italic">No response yet — click Send.</span>
+        </div>
+      </div>
+    </div>
+    <div class="flex justify-between items-center mt-2 text-xs">
+      <div class="text-gray-500">
+        <span id="replay-meta"></span>
+      </div>
+      <div class="flex gap-2">
+        <label class="flex items-center gap-1"><input type="checkbox" id="replay-stream"> stream (SSE)</label>
+        <button id="replay-send" class="px-4 py-1 bg-purple-700 hover:bg-purple-600 rounded">Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---------- State ----------
+const events = new Map();
+let selectedId = null;
+let activeTab = "system";
+let ws = null;
+let rules = [];
+let interceptState = {request: false, response: false};
+const pendingIntercepts = [];
+let currentEditing = null;
+const enabledCats = new Set(["messages"]);
+let apiKey = "";
+let lastCapturedKey = "";
+
+// Patterns that indicate harness-injected content inside what looks like a user message
+const INJECTION_PATTERNS = [
+  { re: /<system-reminder>[\s\S]*?<\/system-reminder>/g, label: "system-reminder" },
+  { re: /<user-prompt-submit-hook>[\s\S]*?<\/user-prompt-submit-hook>/g, label: "hook" },
+  { re: /<command-name>[\s\S]*?<\/command-name>/g, label: "slash-command" },
+  { re: /<command-message>[\s\S]*?<\/command-message>/g, label: "slash-command" },
+  { re: /<command-args>[\s\S]*?<\/command-args>/g, label: "slash-command" },
+  { re: /<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g, label: "command-output" },
+  { re: /<bash-input>[\s\S]*?<\/bash-input>/g, label: "bash-prefix" },
+  { re: /<ide_selection>[\s\S]*?<\/ide_selection>/g, label: "ide" },
+];
+
+// ---------- DOM ----------
+const $ = (sel) => document.querySelector(sel);
+const timeline = $("#timeline");
+const timelineAside = $("#timeline-aside");
+const detail = $("#detail");
+const statusDot = $("#status-dot");
+const statusText = $("#status-text");
+const rulesPanel = $("#rules-panel");
+const rulesList = $("#rules-list");
+const rulesBadge = $("#rules-badge");
+const interceptBar = $("#intercept-bar");
+const interceptInfo = $("#intercept-info");
+
+// ---------- Scroll helpers (console-style: tail if user is at bottom) ----------
+function isNearBottom(el, threshold = 80) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+}
+function scrollToBottom(el) {
+  el.scrollTop = el.scrollHeight;
+}
+
+// ---------- WebSocket ----------
+function connect() {
+  ws = new WebSocket("ws://127.0.0.1:8765");
+  ws.onopen = () => {
+    statusDot.className = "w-2 h-2 rounded-full bg-emerald-500";
+    statusText.textContent = "connected";
+    scrollToBottom(timelineAside);
+  };
+  ws.onclose = () => { statusDot.className = "w-2 h-2 rounded-full bg-red-500"; statusText.textContent = "disconnected — retrying"; setTimeout(connect, 1500); };
+  ws.onmessage = (msg) => handleEvent(JSON.parse(msg.data));
+}
+function send(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+
+function handleEvent(evt) {
+  if (evt.type === "state") {
+    rules = evt.rules || [];
+    interceptState = evt.intercept || {request: false, response: false};
+    $("#intercept-req").checked = interceptState.request;
+    $("#intercept-res").checked = interceptState.response;
+    renderRules();
+    updateRulesBadge();
+    return;
+  }
+  if (evt.type === "intercept_request" || evt.type === "intercept_response") {
+    pendingIntercepts.push(evt);
+    renderInterceptBar();
+    return;
+  }
+  const id = evt.id;
+  if (!events.has(id)) events.set(id, {});
+  const entry = events.get(id);
+  if (evt.type === "request") {
+    entry.request = evt;
+    // Capture the API key for the "use captured" replay shortcut
+    const k = evt.headers && (evt.headers["x-api-key"] || evt.headers["X-Api-Key"] || evt.headers["X-API-Key"]);
+    if (k && k.startsWith("sk-ant-")) lastCapturedKey = k;
+    addTimelineItem("REQ", evt);
+    if (selectedId === null) selectRequest(id);
+  } else if (evt.type === "response") {
+    entry.response = evt;
+    addTimelineItem("RES", evt);
+    if (selectedId === id) renderDetail();
+  }
+}
+
+// ---------- Helpers ----------
+function categoryColor(cat) {
+  return ({messages:"text-emerald-400",mcp_registry:"text-cyan-400",telemetry:"text-yellow-400",datadog:"text-orange-400",npm:"text-pink-400",anthropic_other:"text-gray-400"})[cat] || "text-gray-400";
+}
+
+function escapeHtml(s) { return String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function escapeAttr(s) { return escapeHtml(s).replace(/"/g, "&quot;"); }
+function estTokens(s) { return Math.round((s || "").length / 4); }
+
+// Find injected fragments in a text block and split it into [{ kind, text, label? }]
+function splitInjections(text) {
+  const matches = [];
+  for (const p of INJECTION_PATTERNS) {
+    let m;
+    p.re.lastIndex = 0;
+    while ((m = p.re.exec(text)) !== null) {
+      matches.push({ start: m.index, end: m.index + m[0].length, text: m[0], label: p.label });
+    }
+  }
+  matches.sort((a, b) => a.start - b.start);
+  const parts = [];
+  let cursor = 0;
+  for (const m of matches) {
+    if (m.start > cursor) parts.push({ kind: "text", text: text.slice(cursor, m.start) });
+    parts.push({ kind: "injected", text: m.text, label: m.label });
+    cursor = m.end;
+  }
+  if (cursor < text.length) parts.push({ kind: "text", text: text.slice(cursor) });
+  return parts;
+}
+
+function renderTextBlockWithInjections(text) {
+  const parts = splitInjections(text);
+  if (parts.length === 1 && parts[0].kind === "text") return `<pre class="text-gray-300">${escapeHtml(text)}</pre>`;
+  return parts.map(p => {
+    if (p.kind === "text") return `<pre class="text-gray-300">${escapeHtml(p.text)}</pre>`;
+    return `<div class="injected my-1 p-2"><span class="injection-label">INJECTED · ${escapeHtml(p.label)}</span><pre class="text-red-200 mt-1">${escapeHtml(p.text)}</pre></div>`;
+  }).join("");
+}
+
+// ---------- Timeline (console-style: append, auto-tail) ----------
+function addTimelineItem(kind, evt) {
+  if (!enabledCats.has(evt.category)) return;
+  const wasAtBottom = isNearBottom(timelineAside);
+
+  const li = document.createElement("li");
+  li.className = "px-3 py-2 border-b border-gray-800 cursor-pointer hover:bg-gray-800";
+  li.dataset.id = evt.id;
+  if (selectedId !== null && evt.id == selectedId) li.classList.add("bg-gray-800");
+  const tagColor = kind === "REQ" ? "bg-sky-700" : (evt.status >= 200 && evt.status < 300 ? "bg-emerald-700" : "bg-red-700");
+  const catColor = categoryColor(evt.category);
+  let extra = "";
+  if (kind === "REQ" && evt.body) {
+    const msgCount = (evt.body.messages || []).length;
+    const toolCount = (evt.body.tools || []).length;
+    extra = `<div class="text-gray-500 text-[10px]">${evt.body.model || ""} · ${msgCount} msg · ${toolCount} tools</div>`;
+  } else if (kind === "RES") {
+    extra = `<div class="text-gray-500 text-[10px]">${evt.status} · ${evt.elapsed_ms}ms</div>`;
+  }
+  const hitsMarker = (evt.rule_hits && evt.rule_hits.length) ? `<span class="ml-1 text-amber-400 text-[10px]" title="${escapeAttr(evt.rule_hits.map(h=>h.name).join(', '))}">● ${evt.rule_hits.length}</span>` : "";
+  li.innerHTML = `
+    <div class="flex items-center justify-between mb-1">
+      <span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${tagColor}">${kind}</span>
+      <span class="text-gray-400 text-[10px]">#${evt.id}${hitsMarker}</span>
+    </div>
+    <div class="${catColor} text-[11px] truncate">${evt.category}</div>
+    ${extra}
+  `;
+  li.onclick = () => selectRequest(evt.id);
+  timeline.appendChild(li);
+
+  // Tail to bottom only if user was already at bottom (don't yank them away)
+  if (wasAtBottom) scrollToBottom(timelineAside);
+}
+
+function rerenderTimeline() {
+  timeline.innerHTML = "";
+  const all = [];
+  for (const [id, entry] of events) {
+    if (entry.request) all.push({kind: "REQ", evt: entry.request});
+    if (entry.response) all.push({kind: "RES", evt: entry.response});
+  }
+  all.sort((a, b) => a.evt.timestamp - b.evt.timestamp);
+  for (const item of all) addTimelineItem(item.kind, item.evt);
+  // After a full rerender, jump to the newest (bottom)
+  scrollToBottom(timelineAside);
+}
+
+function selectRequest(id) {
+  selectedId = id;
+  document.querySelectorAll("#timeline li").forEach(li => li.classList.toggle("bg-gray-800", li.dataset.id == id));
+  renderDetail();
+}
+
+document.querySelectorAll(".cat-filter").forEach(cb => cb.onchange = () => {
+  enabledCats.clear();
+  document.querySelectorAll(".cat-filter:checked").forEach(c => enabledCats.add(c.dataset.cat));
+  rerenderTimeline();
+});
+
+// ---------- Tabs ----------
+document.querySelectorAll(".tab").forEach(btn => btn.onclick = () => {
+  activeTab = btn.dataset.tab;
+  document.querySelectorAll(".tab").forEach(b => {
+    b.classList.toggle("border-emerald-400", b === btn);
+    b.classList.toggle("text-emerald-400", b === btn);
+  });
+  renderDetail();
+});
+document.querySelector('.tab[data-tab="system"]').click();
+
+$("#clear").onclick = () => { events.clear(); timeline.innerHTML = ""; selectedId = null; renderDetail(); };
+$("#toggle-rules").onclick = () => rulesPanel.classList.toggle("hidden");
+$("#reset-presets").onclick = () => { if (confirm("Reset all rules to presets (all disabled)?")) send({cmd: "reset_presets"}); };
+
+// ---------- Intercept ----------
+$("#intercept-req").onchange = sendInterceptState;
+$("#intercept-res").onchange = sendInterceptState;
+function sendInterceptState() { send({cmd: "set_intercept", request: $("#intercept-req").checked, response: $("#intercept-res").checked}); }
+
+function renderInterceptBar() {
+  if (pendingIntercepts.length === 0) { interceptBar.classList.add("hidden"); return; }
+  interceptBar.classList.remove("hidden");
+  const cur = pendingIntercepts[0];
+  const kind = cur.type === "intercept_request" ? "REQUEST" : "RESPONSE";
+  interceptInfo.innerHTML = `<span class="text-amber-300">${kind}</span> · #${cur.id} · <span class="text-gray-400">${cur.url || cur.status}</span> · queue: ${pendingIntercepts.length}`;
+}
+
+$("#intercept-release").onclick = () => { const cur = pendingIntercepts.shift(); if (cur) send({cmd: "release", flow_id: cur.flow_id}); renderInterceptBar(); };
+$("#intercept-drop").onclick = () => { const cur = pendingIntercepts.shift(); if (cur) send({cmd: "drop", flow_id: cur.flow_id}); renderInterceptBar(); };
+$("#intercept-edit").onclick = () => {
+  const cur = pendingIntercepts[0];
+  if (!cur) return;
+  currentEditing = cur;
+  $("#edit-textarea").value = cur.raw_body || "";
+  $("#edit-modal").classList.remove("hidden");
+};
+$("#edit-close").onclick = $("#edit-cancel").onclick = () => { $("#edit-modal").classList.add("hidden"); currentEditing = null; };
+$("#edit-apply").onclick = () => {
+  if (!currentEditing) return;
+  send({cmd: "release", flow_id: currentEditing.flow_id, edited_body: $("#edit-textarea").value});
+  pendingIntercepts.shift();
+  $("#edit-modal").classList.add("hidden");
+  currentEditing = null;
+  renderInterceptBar();
+};
+
+// ---------- Rules ----------
+$("#add-rule").onclick = () => {
+  rules.push({ id: "r" + Math.random().toString(36).slice(2, 8), enabled: true, name: "new rule", mode: "literal", target: "request", pattern: "", replacement: "" });
+  renderRules(); pushRules();
+};
+
+function updateRulesBadge() {
+  const active = rules.filter(r => r.enabled).length;
+  rulesBadge.textContent = active;
+  rulesBadge.className = `ml-1 px-1 rounded text-[10px] ${active > 0 ? 'bg-amber-600' : 'bg-emerald-700'}`;
+}
+
+function renderRules() {
+  rulesList.innerHTML = "";
+  if (rules.length === 0) {
+    rulesList.innerHTML = '<div class="text-gray-500 italic text-xs px-2">No rules. Click "+ rule" or "reset".</div>';
+    updateRulesBadge(); return;
+  }
+  rules.forEach((r, i) => {
+    const div = document.createElement("div");
+    const borderColor = r.enabled ? "border-amber-700" : "border-gray-800";
+    div.className = `border ${borderColor} rounded p-2 bg-gray-950`;
+    div.innerHTML = `
+      <div class="flex items-center gap-2 mb-2">
+        <input type="checkbox" ${r.enabled ? "checked" : ""} data-i="${i}" class="r-enabled accent-emerald-500">
+        <input type="text" value="${escapeAttr(r.name)}" data-i="${i}" class="r-name flex-1 bg-gray-900 px-2 py-0.5 text-xs rounded border border-gray-800">
+        <button data-i="${i}" class="r-delete text-red-400 hover:text-red-300 text-xs">✕</button>
+      </div>
+      <div class="flex gap-1 mb-2 text-xs">
+        <select data-i="${i}" class="r-target bg-gray-900 px-1 py-0.5 rounded border border-gray-800 flex-1">
+          <option value="request" ${r.target === "request" ? "selected" : ""}>request</option>
+          <option value="response" ${r.target === "response" ? "selected" : ""}>response</option>
+        </select>
+        <select data-i="${i}" class="r-mode bg-gray-900 px-1 py-0.5 rounded border border-gray-800 flex-1">
+          <option value="literal" ${r.mode === "literal" ? "selected" : ""}>literal</option>
+          <option value="regex" ${r.mode === "regex" ? "selected" : ""}>regex</option>
+        </select>
+      </div>
+      <textarea data-i="${i}" class="r-pattern w-full h-14 bg-gray-900 px-2 py-1 text-xs rounded border border-gray-800 mb-1" placeholder="pattern...">${escapeHtml(r.pattern)}</textarea>
+      <textarea data-i="${i}" class="r-replacement w-full h-14 bg-gray-900 px-2 py-1 text-xs rounded border border-gray-800" placeholder="replacement...">${escapeHtml(r.replacement)}</textarea>
+    `;
+    rulesList.appendChild(div);
+  });
+
+  rulesList.querySelectorAll(".r-enabled").forEach(el => el.onchange = e => { rules[+e.target.dataset.i].enabled = e.target.checked; renderRules(); pushRules(); });
+  rulesList.querySelectorAll(".r-name").forEach(el => el.oninput = e => { rules[+e.target.dataset.i].name = e.target.value; pushRulesDebounced(); });
+  rulesList.querySelectorAll(".r-target").forEach(el => el.onchange = e => { rules[+e.target.dataset.i].target = e.target.value; pushRules(); });
+  rulesList.querySelectorAll(".r-mode").forEach(el => el.onchange = e => { rules[+e.target.dataset.i].mode = e.target.value; pushRules(); });
+  rulesList.querySelectorAll(".r-pattern").forEach(el => el.oninput = e => { rules[+e.target.dataset.i].pattern = e.target.value; pushRulesDebounced(); });
+  rulesList.querySelectorAll(".r-replacement").forEach(el => el.oninput = e => { rules[+e.target.dataset.i].replacement = e.target.value; pushRulesDebounced(); });
+  rulesList.querySelectorAll(".r-delete").forEach(el => el.onclick = e => { rules.splice(+e.target.dataset.i, 1); renderRules(); pushRules(); });
+  updateRulesBadge();
+}
+
+let pushTimer = null;
+function pushRulesDebounced() { clearTimeout(pushTimer); pushTimer = setTimeout(pushRules, 300); }
+function pushRules() { send({cmd: "set_rules", rules}); updateRulesBadge(); }
+
+// ---------- API key modal ----------
+function updateApiKeyDot() {
+  $("#api-key-dot").className = `ml-1 w-2 h-2 inline-block rounded-full align-middle ${apiKey ? 'bg-emerald-500' : 'bg-red-500'}`;
+}
+$("#api-key-btn").onclick = () => {
+  $("#apikey-input").value = apiKey;
+  $("#apikey-modal").classList.remove("hidden");
+};
+$("#apikey-close").onclick = () => $("#apikey-modal").classList.add("hidden");
+$("#apikey-save").onclick = () => { apiKey = $("#apikey-input").value.trim(); updateApiKeyDot(); $("#apikey-modal").classList.add("hidden"); };
+$("#apikey-clear").onclick = () => { $("#apikey-input").value = ""; };
+$("#apikey-from-capture").onclick = () => {
+  if (lastCapturedKey) $("#apikey-input").value = lastCapturedKey;
+  else alert("No captured key yet. Make a request in Claude Code first.");
+};
+
+// ---------- Replay (Repeater) ----------
+$("#replay-btn").onclick = () => {
+  if (selectedId === null) { alert("Select a request first."); return; }
+  const entry = events.get(selectedId);
+  if (!entry || !entry.request) { alert("No request data for the selected event."); return; }
+  if (entry.request.category !== "messages") { alert("Replay only works on /v1/messages requests."); return; }
+  $("#replay-body").value = entry.request.raw_body || "";
+  $("#replay-response").innerHTML = '<span class="text-gray-500 italic">No response yet — click Send.</span>';
+  $("#replay-meta").textContent = `original: #${selectedId} · model: ${entry.request.body?.model || "?"}`;
+  $("#replay-modal").classList.remove("hidden");
+};
+$("#replay-close").onclick = () => $("#replay-modal").classList.add("hidden");
+
+$("#replay-send").onclick = async () => {
+  if (!apiKey) { alert("Set your API key first (top right)."); return; }
+  const respDiv = $("#replay-response");
+  respDiv.innerHTML = '<span class="text-amber-400">Sending…</span>';
+
+  let bodyText = $("#replay-body").value;
+  let bodyObj;
+  try { bodyObj = JSON.parse(bodyText); }
+  catch (e) { respDiv.innerHTML = `<span class="text-red-400">Body is not valid JSON: ${escapeHtml(e.message)}</span>`; return; }
+
+  const wantStream = $("#replay-stream").checked;
+  bodyObj.stream = wantStream;
+
+  const t0 = performance.now();
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify(bodyObj),
+    });
+
+    if (wantStream && resp.body) {
+      respDiv.innerHTML = "";
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const chunks = buf.split("\n\n");
+        buf = chunks.pop();
+        for (const c of chunks) {
+          let evt = null, data = null;
+          for (const line of c.split("\n")) {
+            if (line.startsWith("event:")) evt = line.slice(6).trim();
+            else if (line.startsWith("data:")) data = line.slice(5).trim();
+          }
+          if (evt) respDiv.innerHTML += `<div class="text-cyan-400 text-xs">${escapeHtml(evt)}</div>`;
+          if (data) respDiv.innerHTML += `<div class="text-gray-400 text-xs ml-4">${escapeHtml(data)}</div>`;
+          respDiv.scrollTop = respDiv.scrollHeight;
+        }
+      }
+    } else {
+      const json = await resp.json();
+      respDiv.innerHTML = `<pre class="text-gray-300 text-xs">${escapeHtml(JSON.stringify(json, null, 2))}</pre>`;
+    }
+
+    const ms = Math.round(performance.now() - t0);
+    $("#replay-meta").textContent = `original: #${selectedId} · ${resp.status} · ${ms}ms`;
+  } catch (e) {
+    respDiv.innerHTML = `<span class="text-red-400">Network error: ${escapeHtml(e.message)}</span>`;
+  }
+};
+
+// ---------- Diff ----------
+function findPreviousMessagesRequest(currentId) {
+  // Find the most recent messages-category request before this one
+  const ids = [...events.keys()].filter(id => id < currentId).sort((a, b) => b - a);
+  for (const id of ids) {
+    const e = events.get(id);
+    if (e && e.request && e.request.category === "messages") return e.request;
+  }
+  return null;
+}
+
+function renderDiff(currentReq) {
+  const prev = findPreviousMessagesRequest(currentReq.id);
+  if (!prev) return '<div class="text-gray-500 italic">No earlier messages request to diff against.</div>';
+
+  const curBody = currentReq.body || {};
+  const prevBody = prev.body || {};
+  const curRaw = currentReq.raw_body || "";
+  const prevRaw = prev.raw_body || "";
+  const deltaChars = curRaw.length - prevRaw.length;
+  const deltaTokens = estTokens(curRaw) - estTokens(prevRaw);
+
+  let out = `<div class="mb-4 text-xs text-gray-400">Comparing <span class="text-emerald-400">#${currentReq.id}</span> vs previous messages request <span class="text-emerald-400">#${prev.id}</span></div>`;
+
+  // Summary
+  out += `<div class="mb-4 grid grid-cols-3 gap-2 text-xs">
+    <div class="bg-gray-900 rounded p-2"><div class="text-gray-500">size delta</div><div class="${deltaChars >= 0 ? 'text-amber-400' : 'text-emerald-400'} text-base">${deltaChars >= 0 ? '+' : ''}${deltaChars.toLocaleString()} chars</div></div>
+    <div class="bg-gray-900 rounded p-2"><div class="text-gray-500">tokens (approx)</div><div class="${deltaTokens >= 0 ? 'text-amber-400' : 'text-emerald-400'} text-base">${deltaTokens >= 0 ? '+' : ''}${deltaTokens.toLocaleString()}</div></div>
+    <div class="bg-gray-900 rounded p-2"><div class="text-gray-500">model</div><div class="text-gray-300 text-base">${escapeHtml(curBody.model || '?')}${curBody.model !== prevBody.model ? ` <span class="text-red-400">(was ${escapeHtml(prevBody.model || '?')})</span>` : ''}</div></div>
+  </div>`;
+
+  // System diff
+  const curSysStr = JSON.stringify(curBody.system || []);
+  const prevSysStr = JSON.stringify(prevBody.system || []);
+  out += `<div class="mb-4 border border-gray-800 rounded p-3">
+    <div class="text-xs text-gray-500 mb-2">SYSTEM PROMPT</div>
+    ${curSysStr === prevSysStr ? '<div class="text-gray-500 text-xs">No change.</div>' : '<div class="text-amber-400 text-xs">Changed (rare — usually means CWD changed, skill loaded, or memory updated)</div>'}
+  </div>`;
+
+  // Tools diff
+  const curTools = (curBody.tools || []).map(t => t.name);
+  const prevTools = (prevBody.tools || []).map(t => t.name);
+  const addedTools = curTools.filter(t => !prevTools.includes(t));
+  const removedTools = prevTools.filter(t => !curTools.includes(t));
+  out += `<div class="mb-4 border border-gray-800 rounded p-3">
+    <div class="text-xs text-gray-500 mb-2">TOOLS (${curTools.length} → ${curTools.length})</div>
+    ${addedTools.length === 0 && removedTools.length === 0 ? '<div class="text-gray-500 text-xs">No change.</div>' : ''}
+    ${addedTools.map(t => `<div class="diff-added text-xs">+ ${escapeHtml(t)}</div>`).join("")}
+    ${removedTools.map(t => `<div class="diff-removed text-xs">- ${escapeHtml(t)}</div>`).join("")}
+  </div>`;
+
+  // Messages diff
+  const curMsgs = curBody.messages || [];
+  const prevMsgs = prevBody.messages || [];
+  out += `<div class="border border-gray-800 rounded p-3">
+    <div class="text-xs text-gray-500 mb-2">MESSAGES (${prevMsgs.length} → ${curMsgs.length})</div>`;
+
+  for (let i = 0; i < curMsgs.length; i++) {
+    const cur = curMsgs[i];
+    const prev = prevMsgs[i];
+    const curStr = JSON.stringify(cur);
+    const prevStr = prev ? JSON.stringify(prev) : null;
+    const curSize = curStr.length;
+    const summary = `#${i} · ${cur.role} · ${curSize.toLocaleString()} chars (~${estTokens(curStr)} tokens)`;
+    if (prevStr === null) {
+      out += `<div class="diff-added my-1 text-xs">+ ${escapeHtml(summary)} <span class="text-emerald-400">[NEW]</span></div>`;
+    } else if (curStr !== prevStr) {
+      out += `<div class="diff-added my-1 text-xs">~ ${escapeHtml(summary)} <span class="text-amber-400">[CHANGED]</span></div>`;
+    } else {
+      out += `<div class="diff-unchanged my-1 text-xs">  ${escapeHtml(summary)}</div>`;
+    }
+  }
+  out += `</div>`;
+
+  // Cache analysis (from response if available)
+  const entry = events.get(currentReq.id);
+  if (entry && entry.response && entry.response.body && entry.response.body.events) {
+    const start = entry.response.body.events.find(e => e.event === "message_start");
+    if (start && start.data && start.data.message && start.data.message.usage) {
+      const u = start.data.message.usage;
+      const totalIn = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+      const cacheHitRate = totalIn > 0 ? ((u.cache_read_input_tokens || 0) / totalIn * 100).toFixed(1) : "0";
+      out += `<div class="mt-4 border border-gray-800 rounded p-3 text-xs">
+        <div class="text-gray-500 mb-2">PROMPT CACHE (server-reported)</div>
+        <div>fresh input: <span class="text-amber-400">${u.input_tokens || 0}</span> tokens</div>
+        <div>cache creation: <span class="text-sky-400">${u.cache_creation_input_tokens || 0}</span> tokens</div>
+        <div>cache reads: <span class="text-emerald-400">${u.cache_read_input_tokens || 0}</span> tokens</div>
+        <div class="mt-1">cache hit rate: <span class="text-emerald-400">${cacheHitRate}%</span> · output: ${u.output_tokens || 0}</div>
+      </div>`;
+    }
+  }
+
+  return out;
+}
+
+// ---------- Detail rendering ----------
+function renderDetail() {
+  if (selectedId === null || !events.has(selectedId)) { detail.innerHTML = '<div class="text-gray-500 italic">Select an event from the timeline.</div>'; return; }
+  const entry = events.get(selectedId);
+  const req = entry.request;
+  const resp = entry.response;
+
+  if (req && req.category !== "messages") {
+    detail.innerHTML = `
+      <div class="mb-3"><span class="text-xs ${categoryColor(req.category)}">${req.category}</span> · <span class="text-gray-400 text-xs">${escapeHtml(req.url)}</span></div>
+      <div class="text-xs text-gray-500 mb-1">REQUEST BODY</div>
+      <pre class="text-gray-300 text-xs bg-gray-900 p-2 rounded mb-3">${escapeHtml(req.raw_body || "(empty)")}</pre>
+      <div class="text-xs text-gray-500 mb-1">RESPONSE</div>
+      <pre class="text-gray-300 text-xs bg-gray-900 p-2 rounded">${escapeHtml(resp ? (resp.body.raw || JSON.stringify(resp.body, null, 2)) : "pending…")}</pre>`;
+    return;
+  }
+
+  if (activeTab === "system") {
+    const sys = req?.body?.system;
+    if (!sys) { detail.innerHTML = '<div class="text-gray-500 italic">No system prompt.</div>'; return; }
+    if (typeof sys === "string") detail.innerHTML = `<pre class="text-gray-300">${escapeHtml(sys)}</pre>`;
+    else detail.innerHTML = sys.map((b, i) => `<div class="mb-4 border border-gray-800 rounded p-3"><div class="text-xs text-gray-500 mb-2">block ${i} · type: ${b.type || "?"} · ~${estTokens(b.text)} tokens</div><pre class="text-gray-300">${escapeHtml(b.text || JSON.stringify(b, null, 2))}</pre></div>`).join("");
+  }
+
+  else if (activeTab === "messages") {
+    const msgs = req?.body?.messages || [];
+    detail.innerHTML = msgs.map((m, i) => {
+      const roleColor = m.role === "user" ? "text-sky-400" : "text-amber-400";
+      let content = "";
+      if (typeof m.content === "string") {
+        content = renderTextBlockWithInjections(m.content);
+      } else if (Array.isArray(m.content)) {
+        content = m.content.map(block => {
+          if (block.type === "text") return renderTextBlockWithInjections(block.text || "");
+          if (block.type === "tool_use") return `<div class="border-l-2 border-purple-500 pl-2 my-2"><div class="text-purple-400 text-xs">tool_use → ${escapeHtml(block.name || "?")}</div><pre class="text-gray-400 text-xs">${escapeHtml(JSON.stringify(block.input, null, 2))}</pre></div>`;
+          if (block.type === "tool_result") { const c = typeof block.content === "string" ? block.content : JSON.stringify(block.content, null, 2); return `<div class="border-l-2 border-green-500 pl-2 my-2"><div class="text-green-400 text-xs">tool_result</div><pre class="text-gray-400 text-xs">${escapeHtml(c)}</pre></div>`; }
+          return `<pre class="text-gray-500 text-xs">${escapeHtml(JSON.stringify(block, null, 2))}</pre>`;
+        }).join("");
+      }
+      // Mark the last message so we can scroll to it
+      const lastAttr = i === msgs.length - 1 ? ' data-last-message="true"' : '';
+      return `<div class="mb-4 border border-gray-800 rounded p-3"${lastAttr}><div class="text-xs ${roleColor} mb-2">#${i} · ${m.role}</div>${content}</div>`;
+    }).join("") || '<div class="text-gray-500 italic">No messages.</div>';
+
+    // Console-style: scroll to the most recent message (the one you actually care about)
+    requestAnimationFrame(() => {
+      const last = detail.querySelector('[data-last-message="true"]');
+      if (last) last.scrollIntoView({ block: "start", behavior: "auto" });
+    });
+  }
+
+  else if (activeTab === "tools") {
+    const tools = req?.body?.tools || [];
+    detail.innerHTML = tools.map(t => `<div class="mb-3 border border-gray-800 rounded p-3"><div class="text-purple-400 font-bold">${escapeHtml(t.name || "?")}</div><div class="text-gray-400 text-xs mt-1">${escapeHtml(t.description || "")}</div><details class="mt-2"><summary class="text-xs text-gray-500 cursor-pointer">input_schema · ~${estTokens(JSON.stringify(t))} tokens</summary><pre class="text-gray-400 text-xs mt-2">${escapeHtml(JSON.stringify(t.input_schema, null, 2))}</pre></details></div>`).join("") || '<div class="text-gray-500 italic">No tools declared.</div>';
+  }
+
+  else if (activeTab === "response") {
+    if (!resp) { detail.innerHTML = '<div class="text-gray-500 italic">Waiting for response…</div>'; return; }
+    if (resp.body.streaming) detail.innerHTML = resp.body.events.map(e => `<div class="mb-1 text-xs"><span class="text-cyan-400">${escapeHtml(e.event || "?")}</span><pre class="text-gray-400 ml-4">${escapeHtml(JSON.stringify(e.data || e.raw))}</pre></div>`).join("");
+    else if (resp.body.json) detail.innerHTML = `<pre class="text-gray-300">${escapeHtml(JSON.stringify(resp.body.json, null, 2))}</pre>`;
+    else detail.innerHTML = `<pre class="text-gray-300">${escapeHtml(resp.body.raw || "")}</pre>`;
+  }
+
+  else if (activeTab === "diff") {
+    if (!req) { detail.innerHTML = '<div class="text-gray-500 italic">Select a request event to diff.</div>'; return; }
+    detail.innerHTML = renderDiff(req);
+  }
+
+  else if (activeTab === "raw") {
+    detail.innerHTML = `<pre class="text-gray-400 text-xs">${escapeHtml(JSON.stringify(entry, null, 2))}</pre>`;
+  }
+}
+
+updateApiKeyDot();
+connect();
+</script>
+</body>
+</html>
