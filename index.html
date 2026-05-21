@@ -53,7 +53,7 @@
     </div>
   </header>
 
-  <div class="px-4 py-1 border-b border-gray-800 bg-gray-900 flex items-center gap-2 text-xs">
+  <div class="px-4 py-1 border-b border-gray-800 bg-gray-900 flex items-center gap-2 text-xs flex-wrap">
     <span class="text-gray-500">filter:</span>
     <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="messages" checked> <span class="text-emerald-400">messages</span></label>
     <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="mcp_registry"> <span class="text-cyan-400">mcp_registry</span></label>
@@ -61,6 +61,17 @@
     <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="datadog"> <span class="text-orange-400">datadog</span></label>
     <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="npm"> <span class="text-pink-400">npm</span></label>
     <label class="flex items-center gap-1"><input type="checkbox" class="cat-filter" data-cat="anthropic_other"> <span class="text-gray-400">other</span></label>
+
+    <span class="text-gray-600 mx-2">|</span>
+
+    <span class="text-gray-500">search:</span>
+    <input id="search-input" type="text" placeholder="text, regex if /…/, email, url…"
+           class="bg-gray-950 border border-gray-800 rounded px-2 py-0.5 text-xs text-gray-200 w-64 focus:outline-none focus:border-emerald-700">
+    <label class="flex items-center gap-1 text-gray-400" title="Match body content too (slower on big captures)">
+      <input type="checkbox" id="search-deep" checked class="accent-emerald-500"> deep
+    </label>
+    <span id="search-count" class="text-gray-500 text-[10px]"></span>
+    <button id="search-clear" class="text-gray-500 hover:text-gray-300 text-[10px]">clear</button>
   </div>
 
   <div id="intercept-bar" class="hidden bg-amber-950 border-b border-amber-700 px-4 py-2 text-xs">
@@ -191,6 +202,9 @@ let currentEditing = null;
 const enabledCats = new Set(["messages"]);
 let apiKey = "";
 let lastCapturedKey = "";
+let searchQuery = "";
+let searchRegex = null;        // RegExp when user typed /…/flags, otherwise null
+let searchDeep = true;          // also scan request/response bodies (slower)
 
 // Patterns that indicate harness-injected content inside what looks like a user message
 const INJECTION_PATTERNS = [
@@ -310,9 +324,72 @@ function renderTextBlockWithInjections(text) {
   }).join("");
 }
 
+// ---------- Search ----------
+// Free-text by default (case-insensitive). If the user wraps the query in
+// /…/flags it's parsed as a regex. Useful for grep-style hunts: /\b[a-z0-9._%+-]+@/i
+function parseSearch(raw) {
+  searchQuery = raw;
+  searchRegex = null;
+  if (raw.length >= 2 && raw.startsWith("/")) {
+    const last = raw.lastIndexOf("/");
+    if (last > 0) {
+      try { searchRegex = new RegExp(raw.slice(1, last), raw.slice(last + 1) || "i"); }
+      catch (e) { /* leave as plain text fallback */ }
+    }
+  }
+}
+
+function searchHit(s) {
+  if (!searchQuery) return true;
+  if (s == null) return false;
+  if (searchRegex) return searchRegex.test(s);
+  return String(s).toLowerCase().includes(searchQuery.toLowerCase());
+}
+
+// Match an event against the current search. Cheap fields first; the raw body
+// is only scanned in deep mode.
+function eventMatchesSearch(evt) {
+  if (!searchQuery) return true;
+  if (searchHit(evt.category)) return true;
+  if (searchHit(evt.url)) return true;
+  if (evt.body && evt.body.model && searchHit(evt.body.model)) return true;
+  if (searchDeep) {
+    if (searchHit(evt.raw_body)) return true;
+    // RES events carry parsed body fields instead of raw_body
+    if (evt.body && typeof evt.body === "object") {
+      try { if (searchHit(JSON.stringify(evt.body))) return true; } catch (_) {}
+    }
+  }
+  return false;
+}
+
+function updateSearchCount() {
+  const el = $("#search-count");
+  if (!searchQuery) { el.textContent = ""; return; }
+  const total = timeline.children.length;
+  el.textContent = total ? `${total} hit${total === 1 ? "" : "s"}` : "no matches";
+  el.className = total ? "text-emerald-500 text-[10px]" : "text-red-400 text-[10px]";
+}
+
+let searchTimer = null;
+$("#search-input").oninput = (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    parseSearch(e.target.value);
+    rerenderTimeline();
+  }, 150);
+};
+$("#search-deep").onchange = (e) => { searchDeep = e.target.checked; rerenderTimeline(); };
+$("#search-clear").onclick = () => {
+  $("#search-input").value = "";
+  parseSearch("");
+  rerenderTimeline();
+};
+
 // ---------- Timeline (console-style: append, auto-tail) ----------
 function addTimelineItem(kind, evt) {
   if (!enabledCats.has(evt.category)) return;
+  if (!eventMatchesSearch(evt)) return;
   const wasAtBottom = isNearBottom(timelineAside);
 
   const li = document.createElement("li");
@@ -340,6 +417,7 @@ function addTimelineItem(kind, evt) {
   `;
   li.onclick = () => selectRequest(evt.id);
   timeline.appendChild(li);
+  if (searchQuery) updateSearchCount();
 
   // Tail to bottom only if user was already at bottom (don't yank them away)
   if (wasAtBottom) scrollToBottom(timelineAside);
@@ -354,6 +432,7 @@ function rerenderTimeline() {
   }
   all.sort((a, b) => a.evt.timestamp - b.evt.timestamp);
   for (const item of all) addTimelineItem(item.kind, item.evt);
+  updateSearchCount();
   // After a full rerender, jump to the newest (bottom)
   scrollToBottom(timelineAside);
 }

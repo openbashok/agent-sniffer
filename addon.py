@@ -6,6 +6,12 @@ the Anthropic Messages API.
 Usage:
     mitmdump -s addon.py --listen-port 8080
 
+    # also write a JSONL log of every captured flow for offline post-processing
+    # (e.g. PII / email classification with a separate script):
+    mitmdump -s addon.py --listen-port 8080 \\
+        --set sniffer_log_dir=./captures \\
+        --set sniffer_log_all=false
+
 Features:
     - Captures Anthropic API + Datadog telemetry + npm version checks
     - Parses Messages API requests/responses (including SSE streams)
@@ -13,15 +19,19 @@ Features:
     - Match & replace rules (literal or regex) on requests and responses
     - Intercept mode: holds each flow until the viewer approves/edits it
     - Preset rules library (all disabled by default)
+    - Optional JSONL traffic log (one flow per line) for offline analysis
 """
 
 import asyncio
 import json
+import os
 import re
 import threading
 import time
 import uuid
-from typing import Set, Dict, List
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Set, Dict, List
 
 import websockets
 from mitmproxy import http, ctx
@@ -191,6 +201,44 @@ LOOP: asyncio.AbstractEventLoop = None
 RULES: List[Dict] = list(PRESET_RULES)  # start with presets, all disabled
 INTERCEPT_ON = {"request": False, "response": False}
 PENDING: Dict[str, Dict] = {}
+
+LOG_FILE: Optional[Path] = None
+LOG_LOCK = threading.Lock()
+
+
+# ---------- Traffic logger ----------
+# When `sniffer_log_dir` is set, every captured flow is appended as one JSON
+# object (one line) to {dir}/agent-sniffer-{timestamp}.jsonl. The format is
+# designed for a separate post-processing script that scans for PII, emails,
+# secrets, etc. in what was actually sent to Anthropic.
+
+def init_log_file():
+    global LOG_FILE
+    log_dir = ctx.options.sniffer_log_dir
+    if not log_dir:
+        LOG_FILE = None
+        return
+    p = Path(os.path.expanduser(log_dir))
+    p.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    LOG_FILE = p / f"agent-sniffer-{ts}.jsonl"
+    ctx.log.info(
+        f"[agent-sniffer] traffic log → {LOG_FILE} "
+        f"(log_all={'on' if ctx.options.sniffer_log_all else 'off'})"
+    )
+
+
+def write_log_record(record: Dict):
+    if LOG_FILE is None:
+        return
+    line = json.dumps(record, default=str, ensure_ascii=False)
+    with LOG_LOCK:
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(line)
+                f.write("\n")
+        except OSError as e:
+            ctx.log.warn(f"[agent-sniffer] log write failed: {e}")
 
 
 # ---------- WebSocket server ----------
@@ -395,11 +443,29 @@ class AgentSniffer:
         self.counter = 0
 
     def load(self, loader):
+        loader.add_option(
+            "sniffer_log_dir", str, "",
+            "Directory where one JSONL traffic log per session is written. Empty = disabled.",
+        )
+        loader.add_option(
+            "sniffer_log_all", bool, False,
+            "Log every flow that passes through the proxy, not just classified Anthropic/Datadog/npm traffic.",
+        )
         start_ws_server()
+
+    def running(self):
+        init_log_file()
 
     def request(self, flow: http.HTTPFlow):
         category = classify(flow)
         if category is None:
+            # Unclassified flow. Keep it untouched, but mark it for logging
+            # if the user asked for full-traffic logging.
+            if LOG_FILE is not None and ctx.options.sniffer_log_all:
+                flow.metadata["sniffer_log_only"] = True
+                flow.metadata["sniffer_flow_id"] = str(uuid.uuid4())
+                flow.metadata["sniffer_start"] = time.time()
+                flow.metadata["sniffer_original_request_body"] = flow.request.get_text() or ""
             return
 
         self.counter += 1
@@ -410,7 +476,9 @@ class AgentSniffer:
         flow.metadata["sniffer_category"] = category
 
         original_body = flow.request.get_text() or ""
+        flow.metadata["sniffer_original_request_body"] = original_body
         new_body, hits = apply_rules(original_body, "request")
+        flow.metadata["sniffer_request_rule_hits"] = hits
         if hits:
             flow.request.set_text(new_body)
 
@@ -452,6 +520,28 @@ class AgentSniffer:
         })
 
     def response(self, flow: http.HTTPFlow):
+        # Path A: unclassified flow but full-traffic logging is on.
+        # Just append a minimal record and return — no parsing, no broadcasting.
+        if flow.metadata.get("sniffer_log_only"):
+            write_log_record({
+                "ts": time.time(),
+                "flow_id": flow.metadata.get("sniffer_flow_id"),
+                "category": "unclassified",
+                "method": flow.request.method,
+                "url": flow.request.pretty_url,
+                "request": {
+                    "headers": dict(flow.request.headers),
+                    "body_raw": flow.metadata.get("sniffer_original_request_body", ""),
+                },
+                "response": {
+                    "status": flow.response.status_code,
+                    "headers": dict(flow.response.headers),
+                    "body_raw": flow.response.get_text() or "",
+                    "elapsed_ms": int((time.time() - flow.metadata.get("sniffer_start", time.time())) * 1000),
+                },
+            })
+            return
+
         category = flow.metadata.get("sniffer_category")
         if category is None:
             return
@@ -460,7 +550,9 @@ class AgentSniffer:
         flow_id = flow.metadata.get("sniffer_flow_id")
 
         original_body = flow.response.get_text() or ""
+        flow.metadata["sniffer_original_response_body"] = original_body
         new_body, hits = apply_rules(original_body, "response")
+        flow.metadata["sniffer_response_rule_hits"] = hits
         if hits:
             flow.response.set_text(new_body)
 
@@ -508,6 +600,39 @@ class AgentSniffer:
             "rule_hits": hits,
             "body": body,
         })
+
+        # Persist the full flow for offline post-processing. The bodies kept
+        # here are the raw bytes that actually crossed the wire (i.e. after
+        # any request rules were applied), which is the input a downstream
+        # PII / email / secret classifier should scan.
+        if LOG_FILE is not None:
+            write_log_record({
+                "ts": time.time(),
+                "id": rid,
+                "flow_id": flow_id,
+                "category": category,
+                "method": flow.request.method,
+                "url": flow.request.pretty_url,
+                "request": {
+                    "headers": dict(flow.request.headers),
+                    "body_raw": flow.request.get_text() or "",
+                    "original_body_raw": flow.metadata.get("sniffer_original_request_body", ""),
+                    "rule_hits": flow.metadata.get("sniffer_request_rule_hits", []),
+                    "body_parsed": (
+                        parse_messages_body(flow.request.get_text() or "")
+                        if category == "messages" else None
+                    ),
+                },
+                "response": {
+                    "status": flow.response.status_code,
+                    "headers": dict(flow.response.headers),
+                    "body_raw": flow.response.get_text() or "",
+                    "original_body_raw": flow.metadata.get("sniffer_original_response_body", ""),
+                    "rule_hits": flow.metadata.get("sniffer_response_rule_hits", []),
+                    "elapsed_ms": int(elapsed * 1000),
+                    "parsed": body,
+                },
+            })
 
 
 addons = [AgentSniffer()]
