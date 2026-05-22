@@ -14,11 +14,22 @@ Captures traffic via mitmproxy, parses it into structured form, and streams it t
 
 ## Setup
 
+Requires **Python 3.10+**. Check with `python3 --version`. If your system `python`/`pip` point to Python 2 (common on older macOS), always use `python3` and `pip3` explicitly.
+
 ```bash
 git clone https://github.com/openbashok/agent-sniffer
 cd agent-sniffer
+
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate     # macOS/Linux
+# .venv\Scripts\activate      # Windows PowerShell
+
+# Install dependencies inside the venv
 pip install -r requirements.txt
 ```
+
+From now on, run every command below with the venv activated (`source .venv/bin/activate`). To leave it later: `deactivate`.
 
 First-time only — trust the mitmproxy CA:
 
@@ -29,11 +40,12 @@ mitmdump  # let it run for a moment, then Ctrl+C
 
 ## Run
 
-Three terminals, one browser tab.
+Three terminals, one browser tab. Activate the venv (`source .venv/bin/activate`) in each terminal that runs a Python command.
 
 **Terminal 1 — proxy + sniffer:**
 
 ```bash
+source .venv/bin/activate
 mitmdump -s addon.py --listen-port 8080
 ```
 
