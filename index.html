@@ -97,6 +97,7 @@
         <button data-tab="response" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">response</button>
         <button data-tab="diff" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">diff</button>
         <button data-tab="raw" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">raw</button>
+        <button data-tab="metrics" class="tab px-4 py-2 hover:bg-gray-800 border-b-2 border-transparent">metrics</button>
         <div class="flex-1"></div>
         <button id="replay-btn" class="mr-2 px-3 py-1 bg-purple-700 hover:bg-purple-600 rounded text-xs">↺ replay</button>
       </nav>
@@ -218,6 +219,83 @@ const INJECTION_PATTERNS = [
   { re: /<ide_selection>[\s\S]*?<\/ide_selection>/g, label: "ide" },
 ];
 
+// ---------- Pricing (USD per million tokens) ----------
+// Longest-match prefix wins. Cache writes are billed at the 5m tier (Anthropic
+// defaults to 5m; clients can opt into 1h for ~1.6x). Adjust if you know the
+// client uses 1h cache.
+const PRICING = [
+  { prefix: "claude-opus-4",     input: 15.00, output: 75.00, cacheWrite: 18.75, cacheRead: 1.50 },
+  { prefix: "claude-sonnet-4",   input:  3.00, output: 15.00, cacheWrite:  3.75, cacheRead: 0.30 },
+  { prefix: "claude-haiku-4",    input:  1.00, output:  5.00, cacheWrite:  1.25, cacheRead: 0.10 },
+  { prefix: "claude-3-5-sonnet", input:  3.00, output: 15.00, cacheWrite:  3.75, cacheRead: 0.30 },
+  { prefix: "claude-3-5-haiku",  input:  0.80, output:  4.00, cacheWrite:  1.00, cacheRead: 0.08 },
+  { prefix: "claude-3-opus",     input: 15.00, output: 75.00, cacheWrite: 18.75, cacheRead: 1.50 },
+  { prefix: "claude-3-haiku",    input:  0.25, output:  1.25, cacheWrite:  0.30, cacheRead: 0.03 },
+];
+
+function pricingFor(model) {
+  if (!model) return null;
+  let best = null;
+  for (const p of PRICING) {
+    if (model.startsWith(p.prefix) && (!best || p.prefix.length > best.prefix.length)) best = p;
+  }
+  return best;
+}
+
+// Pull a usage block out of a parsed response. Streaming bodies put input
+// counts in `message_start` and final output count in `message_delta.usage`.
+function extractUsage(resp) {
+  if (!resp || !resp.body) return null;
+  if (resp.body.json && resp.body.json.usage) return resp.body.json.usage;
+  if (resp.body.events) {
+    let u = null;
+    for (const e of resp.body.events) {
+      if (e.event === "message_start" && e.data && e.data.message && e.data.message.usage) {
+        u = Object.assign({}, e.data.message.usage);
+      } else if (e.event === "message_delta" && e.data && e.data.usage) {
+        u = Object.assign(u || {}, e.data.usage);
+      }
+    }
+    return u;
+  }
+  return null;
+}
+
+function computeCost(model, usage) {
+  if (!usage) return null;
+  const p = pricingFor(model);
+  if (!p) return null;
+  const inTok = usage.input_tokens || 0;
+  const outTok = usage.output_tokens || 0;
+  const cw = usage.cache_creation_input_tokens || 0;
+  const cr = usage.cache_read_input_tokens || 0;
+  return (inTok / 1e6) * p.input
+       + (outTok / 1e6) * p.output
+       + (cw / 1e6) * p.cacheWrite
+       + (cr / 1e6) * p.cacheRead;
+}
+
+function totalTokens(usage) {
+  if (!usage) return 0;
+  return (usage.input_tokens || 0)
+       + (usage.output_tokens || 0)
+       + (usage.cache_creation_input_tokens || 0)
+       + (usage.cache_read_input_tokens || 0);
+}
+
+function fmtUSD(v) {
+  if (v == null) return "—";
+  if (v < 0.01) return "$" + v.toFixed(5);
+  if (v < 1)    return "$" + v.toFixed(4);
+  return "$" + v.toFixed(2);
+}
+
+function fmtTok(n) {
+  if (n == null) return "—";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+  return String(n);
+}
+
 // ---------- DOM ----------
 const $ = (sel) => document.querySelector(sel);
 const timeline = $("#timeline");
@@ -275,12 +353,14 @@ function handleEvent(evt) {
     // Capture the API key for the "use captured" replay shortcut
     const k = evt.headers && (evt.headers["x-api-key"] || evt.headers["X-Api-Key"] || evt.headers["X-API-Key"]);
     if (k && k.startsWith("sk-ant-")) lastCapturedKey = k;
-    addTimelineItem("REQ", evt);
+    upsertTimelineRow(id);
     if (selectedId === null) selectRequest(id);
   } else if (evt.type === "response") {
     entry.response = evt;
-    addTimelineItem("RES", evt);
+    upsertTimelineRow(id);
+    saveMetricsSnapshot();
     if (selectedId === id) renderDetail();
+    if (activeTab === "metrics") renderDetail();
   }
 }
 
@@ -386,54 +466,99 @@ $("#search-clear").onclick = () => {
   rerenderTimeline();
 };
 
-// ---------- Timeline (console-style: append, auto-tail) ----------
-function addTimelineItem(kind, evt) {
-  if (!enabledCats.has(evt.category)) return;
-  if (!eventMatchesSearch(evt)) return;
-  const wasAtBottom = isNearBottom(timelineAside);
-
-  const li = document.createElement("li");
-  li.className = "px-3 py-2 border-b border-gray-800 cursor-pointer hover:bg-gray-800";
-  li.dataset.id = evt.id;
-  if (selectedId !== null && evt.id == selectedId) li.classList.add("bg-gray-800");
-  const tagColor = kind === "REQ" ? "bg-sky-700" : (evt.status >= 200 && evt.status < 300 ? "bg-emerald-700" : "bg-red-700");
-  const catColor = categoryColor(evt.category);
-  let extra = "";
-  if (kind === "REQ" && evt.body) {
-    const msgCount = (evt.body.messages || []).length;
-    const toolCount = (evt.body.tools || []).length;
-    extra = `<div class="text-gray-500 text-[10px]">${evt.body.model || ""} · ${msgCount} msg · ${toolCount} tools</div>`;
-  } else if (kind === "RES") {
-    extra = `<div class="text-gray-500 text-[10px]">${evt.status} · ${evt.elapsed_ms}ms</div>`;
+// ---------- Timeline (one row per request id, sorted ascending) ----------
+// REQ creates the row in "pending" state. RES updates it in place with
+// status, latency, tokens, and cost. No more separate REQ/RES rows.
+function insertSortedById(li, id) {
+  const idNum = Number(id);
+  const all = timeline.children;
+  for (let i = 0; i < all.length; i++) {
+    if (Number(all[i].dataset.id) > idNum) {
+      timeline.insertBefore(li, all[i]);
+      return;
+    }
   }
-  const hitsMarker = (evt.rule_hits && evt.rule_hits.length) ? `<span class="ml-1 text-amber-400 text-[10px]" title="${escapeAttr(evt.rule_hits.map(h=>h.name).join(', '))}">● ${evt.rule_hits.length}</span>` : "";
+  timeline.appendChild(li);
+}
+
+function rowMatchesFilters(entry) {
+  const req = entry.request;
+  if (!req) return false;
+  if (!enabledCats.has(req.category)) return false;
+  if (!searchQuery) return true;
+  if (eventMatchesSearch(req)) return true;
+  if (entry.response && eventMatchesSearch(entry.response)) return true;
+  return false;
+}
+
+function upsertTimelineRow(id) {
+  const entry = events.get(id);
+  if (!entry || !entry.request) return;
+  const existing = timeline.querySelector(`li[data-id="${id}"]`);
+  if (!rowMatchesFilters(entry)) {
+    if (existing) existing.remove();
+    if (searchQuery) updateSearchCount();
+    return;
+  }
+
+  const wasAtBottom = isNearBottom(timelineAside);
+  let li = existing;
+  const isNew = !li;
+  if (isNew) {
+    li = document.createElement("li");
+    li.className = "px-3 py-2 border-b border-gray-800 cursor-pointer hover:bg-gray-800";
+    li.dataset.id = id;
+    li.onclick = () => selectRequest(Number(li.dataset.id));
+    insertSortedById(li, id);
+  }
+  li.classList.toggle("bg-gray-800", selectedId !== null && id == selectedId);
+
+  const req = entry.request;
+  const resp = entry.response;
+  const usage = extractUsage(resp);
+  const cost = computeCost(req.body && req.body.model, usage);
+
+  const statusLabel = resp ? String(resp.status) : "…";
+  const statusBg = !resp
+    ? "bg-sky-700"
+    : (resp.status >= 200 && resp.status < 300 ? "bg-emerald-700" : "bg-red-700");
+  const catColor = categoryColor(req.category);
+  const msgCount = ((req.body && req.body.messages) || []).length;
+  const toolCount = ((req.body && req.body.tools) || []).length;
+  const hits = ((req.rule_hits && req.rule_hits.length) || 0)
+             + ((resp && resp.rule_hits && resp.rule_hits.length) || 0);
+  const hitsMarker = hits
+    ? `<span class="ml-1 text-amber-400 text-[10px]">● ${hits}</span>` : "";
+
+  let bottom;
+  if (resp) {
+    const tok = totalTokens(usage);
+    const tokLabel = tok ? ` · ${fmtTok(tok)} tok` : "";
+    const costLabel = cost != null ? ` · ${fmtUSD(cost)}` : "";
+    bottom = `<div class="text-gray-500 text-[10px]">${resp.elapsed_ms}ms${tokLabel}${costLabel}</div>`;
+  } else {
+    bottom = `<div class="text-sky-400 text-[10px] italic">pending…</div>`;
+  }
+
   li.innerHTML = `
     <div class="flex items-center justify-between mb-1">
-      <span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${tagColor}">${kind}</span>
-      <span class="text-gray-400 text-[10px]">#${evt.id}${hitsMarker}</span>
+      <span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${statusBg}">${statusLabel}</span>
+      <span class="text-gray-400 text-[10px]">#${id}${hitsMarker}</span>
     </div>
-    <div class="${catColor} text-[11px] truncate">${evt.category}</div>
-    ${extra}
+    <div class="${catColor} text-[11px] truncate">${req.category}</div>
+    <div class="text-gray-500 text-[10px] truncate">${escapeHtml((req.body && req.body.model) || "")} · ${msgCount} msg · ${toolCount} tools</div>
+    ${bottom}
   `;
-  li.onclick = () => selectRequest(evt.id);
-  timeline.appendChild(li);
-  if (searchQuery) updateSearchCount();
 
-  // Tail to bottom only if user was already at bottom (don't yank them away)
-  if (wasAtBottom) scrollToBottom(timelineAside);
+  if (searchQuery) updateSearchCount();
+  if (isNew && wasAtBottom) scrollToBottom(timelineAside);
 }
 
 function rerenderTimeline() {
   timeline.innerHTML = "";
-  const all = [];
-  for (const [id, entry] of events) {
-    if (entry.request) all.push({kind: "REQ", evt: entry.request});
-    if (entry.response) all.push({kind: "RES", evt: entry.response});
-  }
-  all.sort((a, b) => a.evt.timestamp - b.evt.timestamp);
-  for (const item of all) addTimelineItem(item.kind, item.evt);
+  const ids = [...events.keys()].sort((a, b) => Number(a) - Number(b));
+  for (const id of ids) upsertTimelineRow(id);
   updateSearchCount();
-  // After a full rerender, jump to the newest (bottom)
   scrollToBottom(timelineAside);
 }
 
@@ -738,8 +863,309 @@ function renderDiff(currentReq) {
   return out;
 }
 
+// ---------- Metrics (live + historical) ----------
+// Historical records are populated by loading sniffer JSONL files captured
+// by the addon (`--set sniffer_log_dir=...`). Live records are derived from
+// the `events` map. The metrics tab merges both into one chart.
+let historyRecs = [];
+const HIST_KEY = "agent-sniffer.metrics.history";
+
+function loadHistoryFromStorage() {
+  try {
+    const raw = localStorage.getItem(HIST_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) historyRecs = arr;
+    }
+  } catch (_) {}
+}
+
+function persistHistory() {
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(historyRecs)); }
+  catch (_) { /* quota exceeded — ignore */ }
+}
+
+function recordFromEntry(id, entry) {
+  if (!entry || !entry.request || !entry.response) return null;
+  if (entry.request.category !== "messages") return null;
+  const model = entry.request.body && entry.request.body.model;
+  const usage = extractUsage(entry.response);
+  return {
+    ts: entry.request.timestamp || 0,
+    id,
+    model,
+    status: entry.response.status,
+    elapsed_ms: entry.response.elapsed_ms,
+    usage,
+    cost: computeCost(model, usage),
+    source: "live",
+  };
+}
+
+function recordFromLogLine(line) {
+  // Parse one JSONL flow record emitted by addon.write_log_record.
+  let row;
+  try { row = JSON.parse(line); } catch (_) { return null; }
+  if (!row || row.category !== "messages" || !row.response) return null;
+  const model = row.request && row.request.body_parsed && row.request.body_parsed.model;
+  const usage = extractUsage({ body: row.response.parsed });
+  return {
+    ts: row.ts || 0,
+    id: row.id,
+    model,
+    status: row.response.status,
+    elapsed_ms: row.response.elapsed_ms,
+    usage,
+    cost: computeCost(model, usage),
+    source: "history",
+  };
+}
+
+function liveMetricRecords() {
+  const out = [];
+  for (const [id, entry] of events) {
+    const r = recordFromEntry(id, entry);
+    if (r) out.push(r);
+  }
+  return out;
+}
+
+function saveMetricsSnapshot() {
+  // Persist live session snapshot so a reload keeps the chart for the demo.
+  try {
+    const liveOnly = liveMetricRecords();
+    localStorage.setItem("agent-sniffer.metrics.live", JSON.stringify(liveOnly));
+  } catch (_) {}
+}
+
+async function loadJsonlFile(file) {
+  const text = await file.text();
+  const added = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    const r = recordFromLogLine(line);
+    if (r) added.push(r);
+  }
+  if (added.length === 0) {
+    alert("No /v1/messages flows found in this JSONL.");
+    return;
+  }
+  // Tag with file name so the metrics view can show source breakdown.
+  for (const r of added) r.source_file = file.name;
+  historyRecs.push(...added);
+  persistHistory();
+  if (activeTab === "metrics") renderDetail();
+}
+
+function clearHistory() {
+  historyRecs = [];
+  persistHistory();
+  if (activeTab === "metrics") renderDetail();
+}
+
+function renderMetrics() {
+  const live = liveMetricRecords();
+  const all = [...historyRecs, ...live].sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+  if (all.length === 0) {
+    return `
+      <div class="text-gray-500 italic mb-4">No completed /v1/messages requests yet.</div>
+      ${metricsControlsHtml()}
+    `;
+  }
+
+  let totIn = 0, totOut = 0, totCw = 0, totCr = 0, totCost = 0, totMs = 0;
+  for (const r of all) {
+    const u = r.usage || {};
+    totIn += u.input_tokens || 0;
+    totOut += u.output_tokens || 0;
+    totCw += u.cache_creation_input_tokens || 0;
+    totCr += u.cache_read_input_tokens || 0;
+    totCost += r.cost || 0;
+    totMs += r.elapsed_ms || 0;
+  }
+  const totTok = totIn + totOut + totCw + totCr;
+  const avgCost = totCost / all.length;
+  const cacheHitPct = (totIn + totCr) > 0
+    ? (totCr / (totIn + totCr + totCw) * 100).toFixed(1)
+    : "0";
+
+  // Per-request bars (cost USD)
+  const maxCost = Math.max(1e-6, ...all.map(r => r.cost || 0));
+  const W = 760, H = 180, PAD_L = 40, PAD_R = 12, PAD_T = 12, PAD_B = 24;
+  const innerW = W - PAD_L - PAD_R;
+  const innerH = H - PAD_T - PAD_B;
+  const barW = innerW / all.length;
+  let costBars = "";
+  for (let i = 0; i < all.length; i++) {
+    const r = all[i];
+    const h = (r.cost || 0) / maxCost * innerH;
+    const x = PAD_L + i * barW;
+    const y = PAD_T + innerH - h;
+    const color = r.source === "history" ? "#7c3aed" : "#10b981";
+    costBars += `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${Math.max(1, barW - 1).toFixed(2)}" height="${Math.max(0, h).toFixed(2)}" fill="${color}" opacity="0.85"><title>#${r.id} · ${escapeAttr(r.model || "?")} · ${fmtUSD(r.cost)} · ${r.elapsed_ms}ms</title></rect>`;
+  }
+  // Cumulative cost overlay (skip if no cost computed — usually missing pricing)
+  let cumPath = "";
+  if (totCost > 0) {
+    let acc = 0;
+    cumPath = all.map((r, i) => {
+      acc += r.cost || 0;
+      const x = PAD_L + i * barW + barW / 2;
+      const y = PAD_T + innerH - (acc / totCost) * innerH;
+      return `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`;
+    }).join(" ");
+  }
+  const yTicks = 4;
+  let gridLines = "";
+  for (let i = 0; i <= yTicks; i++) {
+    const y = PAD_T + (innerH * i / yTicks);
+    const label = (maxCost * (yTicks - i) / yTicks);
+    gridLines += `<line x1="${PAD_L}" y1="${y}" x2="${W - PAD_R}" y2="${y}" stroke="#1f2937" stroke-width="1"/>`;
+    gridLines += `<text x="${PAD_L - 4}" y="${y + 3}" font-size="9" fill="#6b7280" text-anchor="end">${fmtUSD(label)}</text>`;
+  }
+
+  // Token stacked bars
+  const maxTok = Math.max(1, ...all.map(r => {
+    const u = r.usage || {};
+    return (u.input_tokens||0)+(u.output_tokens||0)+(u.cache_creation_input_tokens||0)+(u.cache_read_input_tokens||0);
+  }));
+  const TH = 160;
+  const tInnerH = TH - PAD_T - PAD_B;
+  let tokBars = "";
+  for (let i = 0; i < all.length; i++) {
+    const r = all[i];
+    const u = r.usage || {};
+    const total = (u.input_tokens||0)+(u.output_tokens||0)+(u.cache_creation_input_tokens||0)+(u.cache_read_input_tokens||0);
+    if (!total) continue;
+    const x = PAD_L + i * barW;
+    let y = PAD_T + tInnerH;
+    const segs = [
+      { v: u.cache_read_input_tokens || 0, fill: "#10b981" },     // emerald (cheapest)
+      { v: u.cache_creation_input_tokens || 0, fill: "#0ea5e9" }, // sky
+      { v: u.input_tokens || 0, fill: "#f59e0b" },                // amber (fresh, expensive)
+      { v: u.output_tokens || 0, fill: "#a855f7" },               // purple (output)
+    ];
+    for (const s of segs) {
+      const h = (s.v / maxTok) * tInnerH;
+      y -= h;
+      if (h > 0) tokBars += `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${Math.max(1, barW - 1).toFixed(2)}" height="${h.toFixed(2)}" fill="${s.fill}" opacity="0.85"/>`;
+    }
+  }
+  let tGrid = "";
+  for (let i = 0; i <= yTicks; i++) {
+    const y = PAD_T + (tInnerH * i / yTicks);
+    const v = maxTok * (yTicks - i) / yTicks;
+    tGrid += `<line x1="${PAD_L}" y1="${y}" x2="${W - PAD_R}" y2="${y}" stroke="#1f2937" stroke-width="1"/>`;
+    tGrid += `<text x="${PAD_L - 4}" y="${y + 3}" font-size="9" fill="#6b7280" text-anchor="end">${fmtTok(Math.round(v))}</text>`;
+  }
+
+  const tile = (label, value, sub) => `
+    <div class="bg-gray-900 border border-gray-800 rounded p-3">
+      <div class="text-[10px] uppercase text-gray-500">${label}</div>
+      <div class="text-xl text-emerald-400 mt-1">${value}</div>
+      ${sub ? `<div class="text-[10px] text-gray-500 mt-1">${sub}</div>` : ""}
+    </div>`;
+
+  return `
+    ${metricsControlsHtml()}
+    <div class="grid grid-cols-4 gap-2 mb-4">
+      ${tile("requests", all.length, `${live.length} live · ${historyRecs.length} history`)}
+      ${tile("total tokens", fmtTok(totTok), `${fmtTok(totIn)} fresh · ${fmtTok(totCr)} cache-read · ${fmtTok(totOut)} out`)}
+      ${tile("total cost", fmtUSD(totCost), `avg ${fmtUSD(avgCost)} / req`)}
+      ${tile("cache hit", cacheHitPct + "%", `total latency ${(totMs/1000).toFixed(1)}s`)}
+    </div>
+
+    <div class="border border-gray-800 rounded p-3 mb-4">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-xs text-gray-500">Cost per request (bars · USD) — cumulative cost (line)</div>
+        <div class="text-[10px] text-gray-500">
+          <span class="inline-block w-2 h-2 bg-emerald-500 align-middle"></span> live
+          <span class="inline-block w-2 h-2 bg-purple-500 align-middle ml-2"></span> history
+        </div>
+      </div>
+      <svg viewBox="0 0 ${W} ${H}" class="w-full" style="max-height:240px">
+        ${gridLines}
+        ${costBars}
+        <path d="${cumPath}" stroke="#fbbf24" stroke-width="1.5" fill="none" opacity="0.9"/>
+      </svg>
+    </div>
+
+    <div class="border border-gray-800 rounded p-3 mb-4">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-xs text-gray-500">Tokens per request (stacked)</div>
+        <div class="text-[10px] text-gray-500">
+          <span class="inline-block w-2 h-2 bg-emerald-500 align-middle"></span> cache read
+          <span class="inline-block w-2 h-2 bg-sky-500 align-middle ml-2"></span> cache write
+          <span class="inline-block w-2 h-2 bg-amber-500 align-middle ml-2"></span> input fresh
+          <span class="inline-block w-2 h-2 bg-purple-500 align-middle ml-2"></span> output
+        </div>
+      </div>
+      <svg viewBox="0 0 ${W} ${TH}" class="w-full" style="max-height:220px">
+        ${tGrid}
+        ${tokBars}
+      </svg>
+    </div>
+
+    <details class="text-xs text-gray-400">
+      <summary class="cursor-pointer text-gray-500">pricing table (USD per million tokens)</summary>
+      <table class="mt-2 border-collapse">
+        <thead><tr class="text-gray-500">
+          <th class="text-left pr-3 py-1">model prefix</th>
+          <th class="text-right pr-3">input</th>
+          <th class="text-right pr-3">output</th>
+          <th class="text-right pr-3">cache write</th>
+          <th class="text-right">cache read</th>
+        </tr></thead>
+        <tbody>
+          ${PRICING.map(p => `<tr>
+            <td class="pr-3 py-0.5 font-mono">${p.prefix}</td>
+            <td class="text-right pr-3">$${p.input.toFixed(2)}</td>
+            <td class="text-right pr-3">$${p.output.toFixed(2)}</td>
+            <td class="text-right pr-3">$${p.cacheWrite.toFixed(2)}</td>
+            <td class="text-right">$${p.cacheRead.toFixed(2)}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </details>
+  `;
+}
+
+function metricsControlsHtml() {
+  const historyFiles = [...new Set(historyRecs.map(r => r.source_file).filter(Boolean))];
+  return `
+    <div class="flex items-center gap-2 mb-4 text-xs">
+      <label class="px-2 py-1 bg-purple-700 hover:bg-purple-600 rounded cursor-pointer">
+        load JSONL…
+        <input type="file" id="metrics-load" accept=".jsonl,.json,application/json" class="hidden">
+      </label>
+      <button id="metrics-clear-hist" class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded">clear history (${historyRecs.length})</button>
+      <span class="text-gray-500 ml-2">${historyFiles.length ? `loaded: ${historyFiles.map(escapeHtml).join(", ")}` : ""}</span>
+    </div>
+  `;
+}
+
+function wireMetricsControls() {
+  const fileInput = document.getElementById("metrics-load");
+  if (fileInput) fileInput.onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) loadJsonlFile(f);
+    e.target.value = "";
+  };
+  const clearBtn = document.getElementById("metrics-clear-hist");
+  if (clearBtn) clearBtn.onclick = () => {
+    if (confirm("Clear all loaded history? (live session is kept)")) clearHistory();
+  };
+}
+
 // ---------- Detail rendering ----------
 function renderDetail() {
+  // Metrics tab is an aggregate view — doesn't depend on a selected request.
+  if (activeTab === "metrics") {
+    detail.innerHTML = renderMetrics();
+    wireMetricsControls();
+    return;
+  }
   if (selectedId === null || !events.has(selectedId)) { detail.innerHTML = '<div class="text-gray-500 italic">Select an event from the timeline.</div>'; return; }
   const entry = events.get(selectedId);
   const req = entry.request;
@@ -812,6 +1238,7 @@ function renderDetail() {
 }
 
 updateApiKeyDot();
+loadHistoryFromStorage();
 connect();
 </script>
 </body>

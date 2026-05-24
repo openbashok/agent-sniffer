@@ -10,7 +10,8 @@ Captures traffic via mitmproxy, parses it into structured form, and streams it t
 - Tool definitions with JSON schemas
 - Message history, including `tool_use` and `tool_result` blocks
 - Streaming SSE events as they arrive
-- Status, latency, token counts
+- Status, latency, token counts, and estimated USD cost per request
+- Aggregate metrics across a live session or replayed from a JSONL capture
 
 ## Setup
 
@@ -77,6 +78,19 @@ test@example.com         # plain substring, case-insensitive
 ```
 
 The timeline shows only matching items, with a live hit count next to the input.
+
+## Metrics
+
+The `metrics` tab aggregates every completed `/v1/messages` request in the session and renders:
+
+- Summary tiles — request count, total tokens (split fresh / cache-read / output), total and average cost, cache hit %, total latency.
+- **Cost per request** — one bar per request in USD, with a cumulative-cost overlay.
+- **Tokens per request** — stacked bars: cache read, cache write, fresh input, output.
+- A pricing table you can fold open to see the model→USD mapping in use.
+
+Live requests are recorded automatically. Past sessions can be replayed by clicking **load JSONL…** and pointing it at a file written by the addon (`--set sniffer_log_dir=…`). Loaded history is stored in `localStorage` and survives a reload until cleared.
+
+Cost is computed in the browser from the `usage` block of the response (input, output, `cache_creation_input_tokens`, `cache_read_input_tokens`) and the per-million-token rates in the `PRICING` table at the top of `index.html`. Cache writes are billed at the 5-minute tier — edit the table if your client opts into the 1-hour tier. Anthropic's published prices change over time; treat the displayed cost as an estimate and adjust the table when needed.
 
 ## Capture traffic to disk (for offline analysis)
 
